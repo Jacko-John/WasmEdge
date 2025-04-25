@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -31,6 +32,86 @@ namespace WasmEdge {
 namespace Runtime {
 namespace Instance {
 
+class SmartMemoryPool {
+
+public:
+  // std::shared_ptr<spdlog::logger> mylogger;
+  SmartMemoryPool() noexcept = default;
+  SmartMemoryPool(const SmartMemoryPool &SMP) noexcept
+      : Expander(SMP.Expander), Entry(SMP.Entry), CurPages(SMP.CurPages),
+        MaxPages(SMP.MaxPages), FreePages(SMP.FreePages), HitCnt(SMP.HitCnt) {}
+
+  ~SmartMemoryPool() noexcept {
+    printf("======== Memory Pool: Destructed. ========\n");
+    printf("MemoryPool CurPages: %lu\n", CurPages);
+    printf("MemoryPool FreePages: %lu\n", FreePages);
+    printf("MemoryPool HitCnt: %lu\n", HitCnt);
+    printf("MemoryPool Last GrowFactor: %lu\n", Expander.GrowthFactor);
+    printf("======== Memory Pool: Destructed. ========\n");
+  }
+
+  void init(uint64_t KMaxPages, uint64_t InitialSize = 0,
+            uint8_t *InitialData = nullptr) noexcept {
+    Expander.Available = KMaxPages;
+    Expander.GrowthFactor = 150;
+    Expander.BaseGrowth = 1;
+    Entry = InitialData;
+    CurPages = InitialSize;
+    MaxPages = KMaxPages;
+    FreePages = 0;
+    HitCnt = 0;
+  }
+
+  uint8_t *memGrow(uint64_t OldPageCount, uint64_t GrowPageCount) noexcept {
+    uint64_t GrowPages = calculateGrow(OldPageCount, GrowPageCount);
+    uint8_t *NewPtr =
+        (GrowPages > 0)
+            ? Allocator::resize(Entry, CurPages - GrowPages, CurPages)
+            : Entry;
+    if (NewPtr == nullptr) {
+      return nullptr;
+    }
+    Entry = NewPtr;
+    if (GrowPages == 0) {
+      HitCnt++;
+    }
+    return NewPtr;
+  }
+
+private:
+  struct SmartExpander {
+    uint64_t GrowthFactor, BaseGrowth, Available;
+  } Expander;
+  uint8_t *Entry;
+  uint64_t CurPages, MaxPages, FreePages, HitCnt;
+
+  uint64_t div100(const uint64_t &X) noexcept { return X / 100; }
+
+  uint64_t calculateGrow(uint64_t OldPageCount,
+                         uint64_t GrowPageCount) noexcept {
+    uint64_t Request =
+        FreePages < GrowPageCount ? GrowPageCount - FreePages : 0;
+    uint64_t Propose = 0;
+    uint64_t BaseGrowth = Expander.BaseGrowth;
+    uint64_t GrowthFactor = Expander.GrowthFactor;
+    uint64_t BaseGrowthFactor = BaseGrowth * GrowthFactor;
+    if (Request > 0) {
+      if (BaseGrowthFactor >= Request * 25) {
+        Propose = div100(Request * GrowthFactor);
+      } else {
+        Propose = Request + div100(BaseGrowthFactor * 2);
+      }
+      Propose = std::clamp(Propose, Request, Expander.Available);
+      CurPages += Propose;
+      Expander.Available = MaxPages - CurPages;
+    }
+    GrowthFactor = (Propose * 150 < BaseGrowthFactor) ? 90 * GrowthFactor
+                                                      : 170 * GrowthFactor;
+    Expander.GrowthFactor = std::clamp(div100(GrowthFactor), 100UL, 700UL);
+    FreePages = CurPages - OldPageCount - GrowPageCount;
+    return Propose;
+  }
+};
 class MemoryInstance {
 
 public:
@@ -40,12 +121,18 @@ public:
   MemoryInstance(MemoryInstance &&Inst) noexcept
       : MemType(Inst.MemType), DataPtr(Inst.DataPtr),
         PageLimit(Inst.PageLimit) {
+    using namespace std::literals;
+    spdlog::info("======== Memory Instance: Consstructed 1 ========"sv);
     Inst.DataPtr = nullptr;
+    MemPool.init(MemType.getLimit().hasMax() ? MemType.getLimit().getMax()
+                                             : 2 * k4G,
+                 MemType.getLimit().getMin(), DataPtr);
   }
   MemoryInstance(const AST::MemoryType &MType,
                  uint32_t PageLim = UINT32_C(65536)) noexcept
       : MemType(MType), PageLimit(PageLim) {
     using namespace std::literals;
+    spdlog::info("======== Memory Instance: Consstructed 2 ========"sv);
     if (MemType.getLimit().getMin() > PageLimit) {
       spdlog::error("Memory Instance: Limited {} page in configuration."sv,
                     PageLimit);
@@ -57,6 +144,9 @@ public:
       MemType.getLimit().setMin(0U);
       return;
     }
+    MemPool.init(MemType.getLimit().hasMax() ? MemType.getLimit().getMax()
+                                             : 2 * k4G,
+                 MemType.getLimit().getMin(), DataPtr);
   }
   ~MemoryInstance() noexcept {
     Allocator::release(DataPtr, MemType.getLimit().getMin());
@@ -111,12 +201,17 @@ public:
                     PageLimit);
       return false;
     }
-    if (auto NewPtr = Allocator::resize(DataPtr, Min, Min + Count);
-        NewPtr == nullptr) {
+    if (auto NewPtr = MemPool.memGrow(Min, Count); NewPtr == nullptr) {
       return false;
     } else {
       DataPtr = NewPtr;
     }
+    // if (auto NewPtr = Allocator::resize(DataPtr, Min, Min + Count);
+    //     NewPtr == nullptr) {
+    //   return false;
+    // } else {
+    //   DataPtr = NewPtr;
+    // }
     MemType.getLimit().setMin(Min + Count);
     return true;
   }
@@ -338,6 +433,7 @@ public:
 private:
   /// \name Data of memory instance.
   /// @{
+  SmartMemoryPool MemPool;
   AST::MemoryType MemType;
   uint8_t *DataPtr = nullptr;
   const uint32_t PageLimit;
